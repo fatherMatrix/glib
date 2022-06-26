@@ -28,3 +28,9 @@ INSTALL
 # Meson
 /meson-build/
 /subprojects/*/
+
+GPATH
+GRTAGS
+GTAGS
+_build/
+build/
