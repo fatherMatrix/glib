@@ -290,15 +290,17 @@ struct _GMainContext
   gint timeout;			/* Timeout for current iteration */
 
   guint next_id;
-  GList *source_lists;
+  GList *source_lists;		/* source_lists中的每个元素是GSourceList *, 每个指针指向一条链表 */
   gint in_check_or_prepare;
 
-  GPollRec *poll_records;
+  GPollRec *poll_records;	/* 要监听的文件描述符链表，
+				 * 在g_source_attach_unlocked()->g_main_context_add_poll_unlocked()中插入 
+				 */
   guint n_poll_records;
   GPollFD *cached_poll_array;
   guint cached_poll_array_size;
 
-  GWakeup *wakeup;
+  GWakeup *wakeup;	/* 先尝试使用eventfd，如果失败则使用pipe替代 */
 
   GPollFD wake_up_rec;
 
@@ -713,11 +715,11 @@ g_main_context_new_with_flags (GMainContextFlags flags)
 
   context->ref_count = 1;
 
-  context->next_id = 1;
+  context->next_id = 1; /* 0是自己？*/
   
-  context->source_lists = NULL;
+  context->source_lists = NULL; /* 链表真正的分配在第一次source_add_to_context()时 */
   
-  context->poll_func = g_poll;
+  context->poll_func = g_poll;	/* 好像只看到了select/poll，没看见epoll？*/
   
   context->cached_poll_array = NULL;
   context->cached_poll_array_size = 0;
@@ -728,9 +730,11 @@ g_main_context_new_with_flags (GMainContextFlags flags)
   
   context->wakeup = g_wakeup_new ();
   g_wakeup_get_pollfd (context->wakeup, &context->wake_up_rec);
+  /* 内部会调用g_wakeup_signal()唤醒context */
   g_main_context_add_poll_unlocked (context, 0, &context->wake_up_rec);
 
   G_LOCK (main_context_list);
+  /* 全局变量 */
   main_context_list = g_slist_append (main_context_list, context);
 
 #ifdef G_MAIN_POLL_DEBUG
@@ -1244,13 +1248,20 @@ g_source_attach_unlocked (GSource      *source,
   do
     id = context->next_id++;
   while (id == 0 || g_hash_table_contains (context->sources, GUINT_TO_POINTER (id)));
+  /* id == 0? 0号有什么特殊用处？
+   * g_main_context_new()中将context->next_id设为了1
+   */
 
   source->context = context;
   source->source_id = id;
   g_source_ref (source);
 
+  /* 以id作为key，source指针作为value，插入哈希表中 */
   g_hash_table_insert (context->sources, GUINT_TO_POINTER (id), source);
 
+  /* 将source插入context->source_lists中对应优先级的链表中。
+   * context->source_lists是一个链表的链表，每个链表对应一个优先级
+   */
   source_add_to_context (source, context);
 
   if (!SOURCE_BLOCKED (source))
@@ -1258,6 +1269,11 @@ g_source_attach_unlocked (GSource      *source,
       tmp_list = source->poll_fds;
       while (tmp_list)
         {
+	  /* 上边的g_hash_table_insert()和source_add_to_context()其实都没有将
+	   * source关注的fd插入到context->poll_files，这一步才开始真正的插入。
+	   *
+	   * 只有将fd插入到context->poll_files，才会被GMainContext监听和处理。
+	   */
           g_main_context_add_poll_unlocked (context, source->priority, tmp_list->data);
           tmp_list = tmp_list->next;
         }
@@ -1519,8 +1535,10 @@ g_source_add_poll (GSource *source,
   if (context)
     LOCK_CONTEXT (context);
   
+  /* 先添加到source中 */
   source->poll_fds = g_slist_prepend (source->poll_fds, fd);
 
+  /* 再添加到context中 */
   if (context)
     {
       if (!SOURCE_BLOCKED (source))
@@ -3381,6 +3399,9 @@ g_main_dispatch (GMainContext *context)
           GSource *prev_source;
           gint64 begin_time_nsec G_GNUC_UNUSED;
 
+	  /*
+	   * 重点：调用了事件源自定义的dispatch方法
+	   */
 	  dispatch = source->source_funcs->dispatch;
 	  cb_funcs = source->callback_funcs;
 	  cb_data = source->callback_data;
@@ -3704,24 +3725,30 @@ g_main_context_prepare (GMainContext *context,
   context->timeout = -1;
   
   g_source_iter_init (&iter, context, TRUE);
+  /*
+   * iter记住当前迭代位置，通过其中的一个指向GSource的指针
+   * 通过source取出当前迭代的GSource
+   */
   while (g_source_iter_next (&iter, &source))
     {
       gint source_timeout = -1;
 
       if (SOURCE_DESTROYED (source) || SOURCE_BLOCKED (source))
 	continue;
+      /* 只处理最高优先级的source */
       if ((n_ready > 0) && (source->priority > current_priority))
 	break;
 
       if (!(source->flags & G_SOURCE_READY))
 	{
+	  /* source未准备好 */
 	  gboolean result;
 	  gboolean (* prepare) (GSource  *source,
                                 gint     *timeout);
 
           prepare = source->source_funcs->prepare;
 
-          if (prepare)
+          if (prepare) /* 判断是否有source就绪 */
             {
               gint64 begin_time_nsec G_GNUC_UNUSED;
 
@@ -3748,21 +3775,25 @@ g_main_context_prepare (GMainContext *context,
               result = FALSE;
             }
 
-          if (result == FALSE && source->priv->ready_time != -1)
+          if (result == FALSE && source->priv->ready_time != -1) /* 没有事件就绪，判断是否有超时 */
             {
               if (!context->time_is_fresh)
                 {
+		  /* 更新时间 */
                   context->time = g_get_monotonic_time ();
+		  /* 设置时间已刷新 */
                   context->time_is_fresh = TRUE;
                 }
 
               if (source->priv->ready_time <= context->time)
                 {
+		  /* 有超时，设置返回值为True */
                   source_timeout = 0;
                   result = TRUE;
                 }
               else
                 {
+		  /* 没有超时，刷新超时时间，因为上边更新了一次时间 */
                   gint64 timeout;
 
                   /* rounding down will lead to spinning, so always round up */
@@ -3779,6 +3810,7 @@ g_main_context_prepare (GMainContext *context,
 
 	      while (ready_source)
 		{
+		  /* 表示此source已准备好 */
 		  ready_source->flags |= G_SOURCE_READY;
 		  ready_source = ready_source->priv->parent_source;
 		}
@@ -3856,6 +3888,7 @@ g_main_context_query (GMainContext *context,
   lastpollrec = NULL;
   for (pollrec = context->poll_records; pollrec; pollrec = pollrec->next)
     {
+      /* 仅关心高优先级，低优先级就忽略不管 */
       if (pollrec->priority > max_priority)
         continue;
 
@@ -3877,6 +3910,7 @@ g_main_context_query (GMainContext *context,
         }
       else
         {
+	  /* 如果fds还有空闲位置，就写到fds中 */
           if (n_poll < n_fds)
             {
               fds[n_poll].fd = pollrec->fd->fd;
@@ -3885,6 +3919,11 @@ g_main_context_query (GMainContext *context,
             }
 
           n_poll++;
+	  /* 如果fds中没有空闲位置了，则仅增加n_poll计数，本函数退出后，会
+	   * 增加fds尺寸后重新进入一次，再重新query一次。
+	   *
+	   * 这里是有性能问题的!
+	   */
         }
 
       lastpollrec = pollrec;
@@ -4016,6 +4055,9 @@ g_main_context_check (GMainContext *context,
           gboolean result;
           gboolean (* check) (GSource *source);
 
+	  /*
+	   * 重点：调用了事件源自定义的check方法
+	   */
           check = source->source_funcs->check;
 
           if (check)
@@ -4184,8 +4226,12 @@ g_main_context_iterate (GMainContext *context,
   
   UNLOCK_CONTEXT (context);
 
+  /* 检查要处理的source是否准备好，并确定本次要处理的优先级，
+   * max_prioprity保存了这次要处理的source的优先级
+   */
   g_main_context_prepare (context, &max_priority); 
   
+  /* 将prepare确定要处理的优先级中的source对应的文件描述符取出来，放到fds中 */
   while ((nfds = g_main_context_query (context, max_priority, &timeout, fds, 
 				       allocated_nfds)) > allocated_nfds)
     {
@@ -4199,10 +4245,13 @@ g_main_context_iterate (GMainContext *context,
   if (!block)
     timeout = 0;
   
+  /* 调用select/poll */
   g_main_context_poll (context, timeout, max_priority, fds, nfds);
   
+  /* 检查是否需要dispatch，需要的话则将source加入context->pending_dispatch中 */
   some_ready = g_main_context_check (context, max_priority, fds, nfds);
   
+  /* 进行dispatch，最主要的部分是调用了source自定义的dispatch方法 */
   if (dispatch)
     g_main_context_dispatch (context);
   
@@ -4402,6 +4451,7 @@ g_main_loop_run (GMainLoop *loop)
   g_atomic_int_inc (&loop->ref_count);
   g_atomic_int_set (&loop->is_running, TRUE);
   while (g_atomic_int_get (&loop->is_running))
+    /* 主循环函数 */
     g_main_context_iterate (loop->context, TRUE, TRUE, self);
 
   UNLOCK_CONTEXT (loop->context);
@@ -4504,7 +4554,7 @@ g_main_context_poll (GMainContext *context,
 
       LOCK_CONTEXT (context);
 
-      poll_func = context->poll_func;
+      poll_func = context->poll_func;	/* 在g_main_context_new中初始化为了g_poll */
 
       UNLOCK_CONTEXT (context);
       ret = (*poll_func) (fds, n_fds, timeout);
@@ -4621,6 +4671,7 @@ g_main_context_add_poll_unlocked (GMainContext *context,
       nextrec = nextrec->next;
     }
 
+  /* 并没有检查要添加的fd是否已经存在 */
   if (prevrec)
     prevrec->next = newrec;
   else

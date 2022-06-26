@@ -248,7 +248,7 @@ struct _GSource
   gpointer callback_data;
   GSourceCallbackFuncs *callback_funcs;
 
-  const GSourceFuncs *source_funcs;
+  const GSourceFuncs *source_funcs;	/* 对应prepare、check、dispatch等 */
   guint ref_count;
 
   GMainContext *context;
@@ -257,7 +257,7 @@ struct _GSource
   guint flags;
   guint source_id;
 
-  GSList *poll_fds;
+  GSList *poll_fds;	/* 本Source关注的fd */
   
   GSource *prev;
   GSource *next;
