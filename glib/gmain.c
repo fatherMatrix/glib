@@ -300,6 +300,9 @@ struct _GMainContext
   GPollFD *cached_poll_array;
   guint cached_poll_array_size;
 
+  /*
+   * 就是一个eventfd或者pipe，用来做wakeup的通知机制；
+   */
   GWakeup *wakeup;	/* 先尝试使用eventfd，如果失败则使用pipe替代 */
 
   GPollFD wake_up_rec;
@@ -3431,6 +3434,9 @@ g_main_dispatch (GMainContext *context)
 
           TRACE (GLIB_MAIN_BEFORE_DISPATCH (g_source_get_name (source), source,
                                             dispatch, callback, user_data));
+		/*
+		 * dispatch函数真实回调的地方
+		 */
           need_destroy = !(* dispatch) (source, callback, user_data);
           TRACE (GLIB_MAIN_AFTER_DISPATCH (g_source_get_name (source), source,
                                            dispatch, need_destroy));
@@ -3671,6 +3677,11 @@ g_main_context_wait (GMainContext *context,
  *
  * Returns: %TRUE if some source is ready to be dispatched
  *               prior to polling.
+ *
+ * 三件事：
+ * 1. 看有没有准备就绪的事件源，如果有返回true，没有返回false
+ * 2. 找到最高优先级的准备就绪的事件源，把该优先级设置给传出参数priority
+ * 3. 设置GMainContext.timeout 值，表示最近一次要到超时的事件源是何时
  **/
 gboolean
 g_main_context_prepare (GMainContext *context,
@@ -3757,6 +3768,9 @@ g_main_context_prepare (GMainContext *context,
 
               begin_time_nsec = G_TRACE_CURRENT_TIME;
 
+		/*
+		 * 调用时间源的prepare函数；
+		 */
               result = (* prepare) (source, &source_timeout);
               TRACE (GLIB_MAIN_AFTER_PREPARE (source, prepare, source_timeout));
 
@@ -4417,6 +4431,11 @@ g_main_loop_run (GMainLoop *loop)
       gboolean got_ownership = FALSE;
       
       /* Another thread owns this context */
+	/*
+	 * 如果现在是另外的线程own这个context，则当前线程在context->cond信号量
+	 * 上面等待；
+	 * - 另一个线程什么时候V()这个信号量呢？
+	 */
       LOCK_CONTEXT (loop->context);
 
       g_atomic_int_inc (&loop->ref_count);
@@ -4523,6 +4542,9 @@ g_main_loop_get_context (GMainLoop *loop)
 }
 
 /* HOLDS: context's lock */
+/*
+ * 调用poll()类似的函数，如果某个GPollFD上有事件，则将对应事件设置到其revent字段
+ */
 static void
 g_main_context_poll (GMainContext *context,
 		     gint          timeout,
@@ -4661,6 +4683,9 @@ g_main_context_add_poll_unlocked (GMainContext *context,
   newrec->priority = priority;
 
   /* Poll records are incrementally sorted by file descriptor identifier. */
+	/*
+	 * 将fd挂到context->poll_records链表上，按照fd排序；
+	 */
   prevrec = NULL;
   nextrec = context->poll_records;
   while (nextrec)
@@ -4687,6 +4712,9 @@ g_main_context_add_poll_unlocked (GMainContext *context,
 
   context->poll_changed = TRUE;
 
+	/*
+	 * 唤醒context
+	 */
   /* Now wake up the main loop if it is waiting in the poll() */
   g_wakeup_signal (context->wakeup);
 }

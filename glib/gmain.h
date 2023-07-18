@@ -255,11 +255,11 @@ struct _GSource
 
   gint priority;
   guint flags;
-  guint source_id;
+  guint source_id;	/* 作为key插入到GMainContext->sources哈希表中 */
 
   GSList *poll_fds;	/* 本Source关注的fd */
   
-  GSource *prev;
+  GSource *prev;	/* 用于链入GMainContext->source_lists链表的链表中的一个里 */
   GSource *next;
 
   char    *name;

@@ -97,8 +97,8 @@ struct _GPollFD
 #else
   gint		fd;
 #endif
-  gushort 	events;
-  gushort 	revents;
+  gushort 	events;		/* 表示关注什么事件 */
+  gushort 	revents;	/* 表示发生了什么事件 */
 };
 
 /**
